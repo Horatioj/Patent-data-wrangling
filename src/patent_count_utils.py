@@ -11,6 +11,10 @@ REGIONAL_OFFICES = {"EP", "WO", "EA", "OA", "AP", "GC", "BX"}
 # "0" = unknown country, "XX" = not available.
 INVALID_COUNTRY_CODES = {"0", "00", ""}
 
+INVENTOR_COUNTRY_CONTRIB_PATH = (
+    "PATSTAT2025FALL/output/inventor_country_contrib_family.parquet"
+)
+
 
 def convert_2digit_to_3digit(country_code: str):
     """Convert ISO 3166-1 alpha-2 to alpha-3. Returns None on failure."""
@@ -70,6 +74,76 @@ def add_country_3digit(df: pl.DataFrame, country_col: str) -> pl.DataFrame:
         pl.col(country_col)
         .map_elements(convert_2digit_to_3digit, return_dtype=pl.String)
         .alias("country_code_3digit")
+    )
+
+
+def load_inventor_country_contrib(family_ids: pl.DataFrame | None = None) -> pl.DataFrame:
+    """Load inventor-country family shares, optionally filtered to family IDs.
+
+    The contribution file is produced by ``load_classification.py`` and has one
+    row per ``docdb_family_id`` × inventor country, with ``inventor_frac``
+    summing to one within attributed families.
+    """
+    contrib = (
+        pl.read_parquet(INVENTOR_COUNTRY_CONTRIB_PATH)
+        .with_columns(pl.col("country").str.strip_chars().str.to_uppercase())
+        .filter(
+            pl.col("country").is_not_null()
+            & (pl.col("country") != "")
+            & (pl.col("country").str.len_chars() == 2)
+            & (~pl.col("country").is_in(list(INVALID_COUNTRY_CODES)))
+            & (~pl.col("country").is_in(list(REGIONAL_OFFICES)))
+        )
+    )
+
+    if family_ids is not None:
+        contrib = contrib.join(
+            family_ids.select("docdb_family_id").unique(),
+            on="docdb_family_id",
+            how="semi",
+        )
+
+    return contrib
+
+
+def print_inventor_attrition(
+    family_ids: pl.DataFrame,
+    contrib: pl.DataFrame,
+    label: str,
+):
+    """Print inventor-country coverage for a selected family universe."""
+    total = family_ids["docdb_family_id"].n_unique()
+    attributed = contrib["docdb_family_id"].n_unique()
+    missing = total - attributed
+    rate = missing / total if total else 0.0
+    print(
+        f"  Inventor-country attribution for {label}: "
+        f"{attributed:,}/{total:,} families; missing {missing:,} ({rate:.2%})"
+    )
+
+
+def inventor_fractional_country_year(
+    family_year: pl.DataFrame,
+    year_col: str,
+    value_col: str,
+) -> pl.DataFrame:
+    """Sum inventor-fractional family counts by country × year.
+
+    ``family_year`` must contain ``docdb_family_id`` and *year_col*. Families
+    without inventor-country attribution are left out of the fractional count;
+    callers should use ``print_inventor_attrition`` to report that attrition.
+    """
+    family_year = family_year.select(["docdb_family_id", year_col]).unique()
+    contrib = load_inventor_country_contrib(family_year.select("docdb_family_id"))
+    print_inventor_attrition(family_year.select("docdb_family_id"), contrib, value_col)
+
+    return (
+        family_year
+        .join(contrib.select(["docdb_family_id", "country", "inventor_frac"]),
+              on="docdb_family_id", how="inner")
+        .rename({"country": "countries"})
+        .group_by(["countries", year_col])
+        .agg(pl.col("inventor_frac").sum().alias(value_col))
     )
 
 

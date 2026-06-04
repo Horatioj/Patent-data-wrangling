@@ -83,7 +83,7 @@ def pagerank_sparse(adj: sparse.csr_matrix, alpha: float = 0.85,
         if np.abs(pr_new - pr).max() < tol:
             break
         pr = pr_new
-    return pr_new
+    return pr
 
 
 def hits_sparse(adj: sparse.csr_matrix,
@@ -100,7 +100,7 @@ def hits_sparse(adj: sparse.csr_matrix,
         if np.abs(a_new - a).max() < tol:
             break
         a = a_new
-    return h, a_new
+    return h, a
 
 
 def fit_power_law_mle(degrees: np.ndarray, k_min: int = 1) -> dict:

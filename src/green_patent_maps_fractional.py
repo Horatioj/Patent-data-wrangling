@@ -1,10 +1,11 @@
 """
-Green patent world maps — fractional inventor-country counting.
+Green patent world maps — inventor-fractional country counting.
 
-Each patent family is credited to each of its inventor/applicant countries
-with weight  w = 1 / n_countries  (fractional counting).  The global sum of
-fractional counts equals the number of unique DOCDB families, unlike full
-counting where the sum = n_families × avg_countries_per_family.
+Green and high-influence patent families are credited to inventor countries
+using inventor-country shares from inventor_country_contrib_family.parquet.
+For example, a family with two inventors from A and one from B contributes
+2/3 to A and 1/3 to B. Families without inventor-country data are reported
+as attribution attrition and are not assigned through appln_auth fallback.
 
 Maps produced (Equal Earth projection, Reds palette, Jenks k=6):
   FRAC1 — Green patent families        (fractional)
@@ -49,6 +50,7 @@ K    = 6
 CMAP = "Reds"
 P99  = 0.999          # cumulative volume threshold for colour inclusion
 NO_DATA_COLOR = "#f2f2f2"
+INVENTOR_CONTRIB_PATH = "PATSTAT2025FALL/output/inventor_country_contrib_family.parquet"
 
 os.makedirs(OUT, exist_ok=True)
 
@@ -81,9 +83,7 @@ ISO2_TO_ISO3 = {
     "SY":"SYR","TJ":"TJK","TZ":"TZA","TH":"THA","TL":"TLS","TG":"TGO","TO":"TON",
     "TT":"TTO","TN":"TUN","TR":"TUR","TM":"TKM","TV":"TUV","UG":"UGA","UA":"UKR",
     "AE":"ARE","GB":"GBR","US":"USA","UY":"URY","UZ":"UZB","VU":"VUT","VE":"VEN",
-    "VN":"VNM","YE":"YEM","ZM":"ZMB","ZW":"ZWE",
-    # Taiwan — included per study design
-    "TW":"TWN",
+    "VN":"VNM","YE":"YEM","ZM":"ZMB","ZW":"ZWE", "TW":"TWN",
     # Historical / dissolved states — merged to primary successor:
     #   DD → DEU  (East Germany absorbed into Germany after reunification)
     #   SU → RUS  (Russia inherited Soviet patent system)
@@ -118,37 +118,89 @@ def build_country_list(df: pl.DataFrame,
         .filter(pl.col("country") != "")
         .select([family_col, "country"])
     )
-    # Fallback: filing office for applications without inventor data
+    # Use the pre-computed 1-to-1 family to country mapping for fallback
+    fam_country = pl.read_parquet("PATSTAT2025FALL/output/docdb_family_country.parquet")
+
     without_person = (
-        df.select([family_col, "appln_auth", "person_ctry_code"])
+        df.select([family_col, "person_ctry_code"])
         .filter(pl.col("person_ctry_code").is_null() |
                 (pl.col("person_ctry_code") == ""))
+        .join(fam_country, left_on=family_col, right_on="docdb_family_id", how="inner")
         .filter(
-            pl.col("appln_auth").is_not_null() &
-            (pl.col("appln_auth") != "") &
-            (~pl.col("appln_auth").is_in(list(DROP_CODES)))
+            pl.col("country").is_not_null() &
+            (pl.col("country") != "") &
+            (~pl.col("country").is_in(list(DROP_CODES)))
         )
-        .select([family_col, pl.col("appln_auth").alias("country")])
+        .select([family_col, "country"])
     )
     return pl.concat([with_person, without_person]).unique()
 
 
 def fractional_counts(family_country: pl.DataFrame,
                       family_col: str = "docdb_family_id",
-                      val_col: str = "frac_count") -> pd.DataFrame:
+                      val_col: str = "frac_count",
+                      weight_col: str | None = None,
+                      normalize_weights: bool = True) -> pd.DataFrame:
     """
-    Given a (family_id, country) table, compute fractional weight = 1/n_countries
-    per family, then sum by country.
+    Sum country-level fractional counts.
+
+    Default mode expects one row per (family, country) and computes a
+    country-presence fractional weight = 1 / n_unique_countries per family.
+    This preserves the current workflow.
+
+    If weight_col is supplied, its values are treated as raw country
+    contribution weights, for example inventor counts by country. With
+    normalize_weights=True, weights are normalised within each family so a
+    patent with two inventors from A and one from B contributes 2/3 to A and
+    1/3 to B.
+
     Historical codes (DD, SU, CS, YU, AN) are remapped via ISO2_TO_ISO3 and
     their fractional counts merged into the successor state.
     Returns pd.DataFrame[country, iso3, val_col].
     """
-    n_ctry = (family_country
-              .group_by(family_col)
-              .agg(pl.len().alias("n_countries")))
-    weighted = (family_country
-                .join(n_ctry, on=family_col, how="left")
-                .with_columns((1.0 / pl.col("n_countries")).alias("weight")))
+    required_cols = {family_col, "country"}
+    if weight_col is not None:
+        required_cols.add(weight_col)
+    missing_cols = required_cols - set(family_country.columns)
+    if missing_cols:
+        raise ValueError(f"family_country is missing columns: {sorted(missing_cols)}")
+
+    if weight_col is None:
+        country_weights = family_country.select([family_col, "country"]).unique()
+        n_ctry = (
+            country_weights
+            .group_by(family_col)
+            .agg(pl.len().alias("n_countries"))
+        )
+        weighted = (
+            country_weights
+            .join(n_ctry, on=family_col, how="left")
+            .with_columns((1.0 / pl.col("n_countries")).alias("weight"))
+        )
+    else:
+        weighted = (
+            family_country
+            .select([family_col, "country", weight_col])
+            .group_by([family_col, "country"])
+            .agg(pl.col(weight_col).sum().alias("raw_weight"))
+        )
+        if normalize_weights:
+            family_totals = (
+                weighted
+                .group_by(family_col)
+                .agg(pl.col("raw_weight").sum().alias("family_weight_total"))
+            )
+            weighted = (
+                weighted
+                .join(family_totals, on=family_col, how="left")
+                .filter(pl.col("family_weight_total") > 0)
+                .with_columns(
+                    (pl.col("raw_weight") / pl.col("family_weight_total")).alias("weight")
+                )
+            )
+        else:
+            weighted = weighted.rename({"raw_weight": "weight"})
+
     result = (weighted
               .group_by("country")
               .agg(pl.col("weight").sum().alias(val_col))
@@ -159,6 +211,49 @@ def fractional_counts(family_country: pl.DataFrame,
                     .groupby("iso3", as_index=False)
                     .agg(country=("country", "first"), **{val_col: (val_col, "sum")}))
     return result
+
+
+def load_inventor_fractional_counts(
+    family_ids: pl.DataFrame,
+    val_col: str,
+    label: str,
+) -> pd.DataFrame:
+    """Aggregate inventor-country fractional family counts for selected families."""
+    if not os.path.exists(INVENTOR_CONTRIB_PATH):
+        raise FileNotFoundError(
+            f"{INVENTOR_CONTRIB_PATH} not found. Run src/load_classification.py "
+            "to create inventor-country contribution tables first."
+        )
+
+    family_ids = family_ids.select("docdb_family_id").unique()
+    total_families = family_ids.height
+    contrib = (
+        pl.read_parquet(INVENTOR_CONTRIB_PATH)
+        .with_columns(pl.col("country").str.strip_chars().str.to_uppercase())
+        .filter(
+            pl.col("country").is_not_null()
+            & (pl.col("country") != "")
+            & (pl.col("country").str.len_chars() == 2)
+            & (~pl.col("country").is_in(list(DROP_CODES)))
+        )
+        .join(family_ids, on="docdb_family_id", how="semi")
+    )
+
+    attributed_families = contrib["docdb_family_id"].n_unique()
+    missing_families = total_families - attributed_families
+    missing_rate = missing_families / total_families if total_families else 0.0
+    print(
+        f"  {label}: inventor-country attribution "
+        f"{attributed_families:,}/{total_families:,} families; "
+        f"missing {missing_families:,} ({missing_rate:.2%})"
+    )
+
+    return fractional_counts(
+        contrib,
+        val_col=val_col,
+        weight_col="inventor_frac",
+        normalize_weights=False,
+    )
 
 
 # ── Load data ─────────────────────────────────────────────────────────────────
@@ -179,35 +274,32 @@ nb_pers = pl.read_parquet("PATSTAT2025FALL/output/neighbor_persons_agg.parquet")
 
 print("All data loaded.\n")
 
-# ── Green families: fractional ────────────────────────────────────────────────
-print("Building green family country lists ...")
-green_fc = build_country_list(green)
-# deduplicate to unique (family, country) pairs across all applications
-green_fc = green_fc.unique()
-# keep only valid 2-char codes, drop regional offices
-green_fc = green_fc.filter(
-    pl.col("country").str.len_chars() == 2
-).filter(~pl.col("country").is_in(list(DROP_CODES)))
-
-frac_green = fractional_counts(green_fc, val_col="frac_green_fam")
+# ── Green families: inventor-fractional ───────────────────────────────────────
+print("Building green family inventor-fractional counts ...")
+green_family_ids = green.select("docdb_family_id").unique()
+frac_green = load_inventor_fractional_counts(
+    green_family_ids,
+    val_col="frac_green_fam",
+    label="Green families",
+)
 total_frac_green = frac_green["frac_green_fam"].sum()
 print(f"  Fractional green family total: {total_frac_green:,.0f}  "
-      f"(should be ~635,359 unique families)")
+      f"(equals green families with inventor-country attribution)")
 
-# ── Hi-influence families: fractional ─────────────────────────────────────────
-print("Building hi-influence family country lists ...")
-hi_fc = build_country_list(hi_raw)
-hi_fc = hi_fc.unique().filter(
-    pl.col("country").str.len_chars() == 2
-).filter(~pl.col("country").is_in(list(DROP_CODES)))
-
-frac_hi = fractional_counts(hi_fc, val_col="frac_hi_fam")
+# ── Hi-influence families: inventor-fractional ────────────────────────────────
+print("Building hi-influence family inventor-fractional counts ...")
+hi_family_ids = hi_raw.select("docdb_family_id").unique()
+frac_hi = load_inventor_fractional_counts(
+    hi_family_ids,
+    val_col="frac_hi_fam",
+    label="High-influence families",
+)
 total_frac_hi = frac_hi["frac_hi_fam"].sum()
 print(f"  Fractional hi-influence total: {total_frac_hi:,.0f}  "
-      f"(should be ~304,858 unique hi families)")
+      f"(equals hi families with inventor-country attribution)")
 
-# ── Neighbor families: fractional ─────────────────────────────────────────────
-print("Building neighbor family country lists (join chain) ...")
+# ── Neighbor families: country-presence fractional ────────────────────────────
+print("Building neighbor family country lists (country-presence fractional) ...")
 
 # Step 1: get person_ctry_code per neighbor family via index → persons
 nb_person_ctry = (
@@ -225,13 +317,12 @@ nb_person_ctry = (
 )
 
 # Step 2: appln_auth fallback for families with no person data
+fam_country = pl.read_parquet("PATSTAT2025FALL/output/docdb_family_country.parquet")
 nb_has_person = nb_person_ctry.select("docdb_family_id").unique()
 nb_auth_fallback = (
-    nb_raw
+    nb_raw.select("docdb_family_id").unique()
     .join(nb_has_person, on="docdb_family_id", how="anti")
-    .with_columns(pl.col("appln_auth").str.split(","))
-    .explode("appln_auth")
-    .with_columns(pl.col("appln_auth").str.strip_chars().alias("country"))
+    .join(fam_country, on="docdb_family_id", how="inner")
     .filter(
         pl.col("country").is_not_null() &
         (pl.col("country") != "") &
@@ -251,20 +342,23 @@ total_frac_nb = frac_nb["frac_nb_fam"].sum()
 print(f"  Fractional neighbor total: {total_frac_nb:,.0f}  "
       f"(should be ~6,475,040 unique neighbor families)")
 
-# ── Leadership index (same CSV as full-counting script) ────────────────────────
-print("Loading index_by_total.csv ...")
-idx_raw = pd.read_csv("ClimateDataAnalysis/out/index_by_total.csv",
+# ── Leadership index (fractional-count version) ────────────────────────────────
+print("Loading index_by_total_frac.csv ...")
+idx_raw = pd.read_csv("ClimateDataAnalysis/out/index_by_total_frac.csv",
                       keep_default_na=False)
 idx_raw = idx_raw.rename(columns={"country": "iso2"})
 idx_raw["iso3"] = idx_raw["iso2"].map(ISO2_TO_ISO3)
-idx_df = (idx_raw.dropna(subset=["iso3"])
-          .groupby("iso3", as_index=False)
-          .agg(
-              iso2        = ("iso2",         "first"),
-              num_patents = ("num_patents",   "sum"),
-              index_score = ("index_score",   lambda x:
-                             np.average(x, weights=idx_raw.loc[x.index, "num_patents"])),
-          ))
+idx_score_df = (idx_raw.dropna(subset=["iso3"])
+                .groupby("iso3", as_index=False)
+                .agg(
+                    iso2        = ("iso2",       "first"),
+                    index_score = ("index_score", "mean"),
+                ))
+idx_volume_df = frac_green[["iso3", "frac_green_fam"]].rename(
+    columns={"frac_green_fam": "inventor_frac_count"}
+)
+idx_df = idx_score_df.merge(idx_volume_df, on="iso3", how="left")
+idx_df["inventor_frac_count"] = idx_df["inventor_frac_count"].fillna(0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -368,9 +462,9 @@ def plot_frac_choropleth(ax: plt.Axes,
     ax.legend(handles=[no_data_patch], loc="lower right",
               fontsize=6.5, frameon=False, handlelength=1.0, handleheight=0.8)
     ax.set_title(title, fontsize=14, pad=8)
-    if subtitle:
-        ax.text(0.5, 1.003, subtitle, transform=ax.transAxes,
-                ha="center", va="bottom", fontsize=7.5, color="#444444")
+    # if subtitle:
+    #     ax.text(0.5, 1.003, subtitle, transform=ax.transAxes,
+    #             ha="center", va="bottom", fontsize=7.5, color="#444444")
 
 
 def plot_frac_rate(ax: plt.Axes,
@@ -427,9 +521,9 @@ def plot_frac_rate(ax: plt.Axes,
     ax.legend(handles=[no_data_patch], loc="lower right",
               fontsize=6.5, frameon=False, handlelength=1.0, handleheight=0.8)
     ax.set_title(title, fontsize=14, pad=8)
-    if subtitle:
-        ax.text(0.5, 1.003, subtitle, transform=ax.transAxes,
-                ha="center", va="bottom", fontsize=7.5, color="#444444")
+    # if subtitle:
+    #     ax.text(0.5, 1.003, subtitle, transform=ax.transAxes,
+    #             ha="center", va="bottom", fontsize=7.5, color="#444444")
 
 
 def plot_frac_choropleth_index(ax: plt.Axes,
@@ -494,15 +588,15 @@ print("Computing top-99.9% country sets ...")
 inc_fg  = top_pct_iso3(frac_green, "frac_green_fam")
 inc_fhi = top_pct_iso3(frac_hi,   "frac_hi_fam")
 inc_fnb = top_pct_iso3(frac_nb,   "frac_nb_fam")
-inc_idx = top_pct_iso3(idx_df,    "num_patents")
+inc_idx = top_pct_iso3(idx_df,    "inventor_frac_count")
 
 # ── Merge onto world GDF (NaN outside threshold → grey) ───────────────────────
 world_fg  = merge_world_frac(frac_green, "frac_green_fam", inc_fg)
 world_fhi = merge_world_frac(frac_hi,   "frac_hi_fam",    inc_fhi)
 world_fnb = merge_world_frac(frac_nb,   "frac_nb_fam",    inc_fnb)
 
-# Index map: filter by num_patents volume, then display index_score
-idx_display = idx_df[["iso3", "index_score", "num_patents"]].copy()
+# Index map: filter by inventor-fractional green volume, then display index_score
+idx_display = idx_df[["iso3", "index_score", "inventor_frac_count"]].copy()
 idx_display.loc[~idx_display["iso3"].isin(inc_idx), "index_score"] = np.nan
 world_fidx = world_base.merge(
     idx_display[["iso3", "index_score"]].dropna(subset=["index_score"]),
@@ -527,7 +621,7 @@ world_frate = world_base.merge(
 TITLE_FAM = r"Quantity of Climate Related Patent Families"
 TITLE_HI  = r"Quantity of High Influential Climate Patent Families"
 TITLE_NB  = r"Quantity of Non-Climate Neighbor Patent Families"
-TITLE_IDX = r"Climate Patent Leadership Index"
+TITLE_IDX = r"Global Climate Innovation Index"
 
 MAPS = [
     (world_fg,   "frac_green_fam", TITLE_FAM, "FRAC1_green_families.png",    "count"),
@@ -597,7 +691,7 @@ print("Saved FRAC0_composite_4panel.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7.  Country summary CSV (fractional) + comparison table with full counting
+# 7.  Country summary CSV (inventor-fractional) + comparison with full counting
 # ═══════════════════════════════════════════════════════════════════════════════
 frac_summary = (
     frac_green[["country","iso3","frac_green_fam"]].rename(
@@ -606,16 +700,16 @@ frac_summary = (
            on="iso3", how="outer")
     .merge(frac_nb[["iso3","frac_nb_fam"]].rename(columns={"frac_nb_fam":"frac_nb"}),
            on="iso3", how="outer")
-    .merge(idx_df[["iso3","index_score","num_patents"]], on="iso3", how="outer")
+    .merge(idx_df[["iso3","index_score","inventor_frac_count"]], on="iso3", how="outer")
     .sort_values("frac_green", ascending=False)
 )
 frac_summary[["frac_green","frac_hi","frac_nb"]] = (
     frac_summary[["frac_green","frac_hi","frac_nb"]].round(1))
-frac_summary.to_csv(f"{OUT}/country_summary_fractional.csv", index=False)
+frac_summary.to_csv(f"{OUT}/country_summary_inventor_fractional.csv", index=False)
 
 focus = ["US","CN","JP","KR","DE","GB","FR","IN","AU","CH"]
 print("\n" + "=" * 90)
-print("FRACTIONAL vs FULL COUNTING — selected countries")
+print("INVENTOR-FRACTIONAL vs FULL COUNTING — selected countries")
 print("=" * 90)
 
 q_full = pd.read_csv("PATSTAT2025FALL/output/oecd_patent_quality_country_rankings.csv",
@@ -644,5 +738,5 @@ for _, r in comp.iterrows():
           f"{r['frac_hi']:>8,.0f}  {r['full_hi']:>8,.0f}  "
           f"{r['frac_rate']:>9.1f}%  {r['full_rate']:>9.1f}%")
 
-print(f"\nFractional CSV -> {OUT}/country_summary_fractional.csv")
+print(f"\nInventor-fractional CSV -> {OUT}/country_summary_inventor_fractional.csv")
 print(f"Maps           -> {OUT}/FRAC0-FRAC5.png")

@@ -11,6 +11,8 @@ import polars as pl
 from patent_count_utils import (
     build_complete_grid,
     add_country_3digit,
+    inventor_fractional_country_year,
+    load_inventor_country_contrib,
     print_summary,
 )
 
@@ -32,13 +34,14 @@ df_country_patents = (
 )
 
 VALUE_COLS = [
-    "num_patents",
+    "num_patents", "inventor_frac_patents",
     "avg_forward_cites_5yr", "avg_family_size", "avg_claims",
     "avg_generality", "avg_generality_oecd",
     "avg_norm_cites", "avg_norm_family", "avg_norm_claims",
     "avg_norm_generality", "avg_norm_generality_oecd",
     "country_pqi_hall", "country_pqi_hall_median",
     "country_pqi_oecd", "country_pqi_oecd_median",
+    "inventor_frac_pqi_hall", "inventor_frac_pqi_oecd",
     "total_citations_5yr",
     "quality_std_hall", "quality_std_oecd",
 ]
@@ -77,16 +80,73 @@ df_country_year = (
     ])
 )
 
+df_inventor_frac = inventor_fractional_country_year(
+    df_family.select(["docdb_family_id", "family_year"]),
+    "family_year",
+    "inventor_frac_patents",
+)
+
+inventor_contrib = load_inventor_country_contrib(df_family.select("docdb_family_id"))
+df_inventor_frac_quality = (
+    df_family
+    .select([
+        "docdb_family_id",
+        "family_year",
+        "patent_quality_index_4",
+        "patent_quality_index_4_oecd",
+    ])
+    .join(
+        inventor_contrib.select(["docdb_family_id", "country", "inventor_frac"]),
+        on="docdb_family_id",
+        how="inner",
+    )
+    .rename({"country": "countries"})
+    .with_columns([
+        (pl.col("patent_quality_index_4") * pl.col("inventor_frac")).alias("_weighted_pqi_hall"),
+        (pl.col("patent_quality_index_4_oecd") * pl.col("inventor_frac")).alias("_weighted_pqi_oecd"),
+    ])
+    .group_by(["countries", "family_year"])
+    .agg([
+        (
+            pl.col("_weighted_pqi_hall").sum()
+            / pl.col("inventor_frac").sum()
+        ).alias("inventor_frac_pqi_hall"),
+        (
+            pl.col("_weighted_pqi_oecd").sum()
+            / pl.col("inventor_frac").sum()
+        ).alias("inventor_frac_pqi_oecd"),
+    ])
+)
+
+country_year_keys = pl.concat([
+    df_country_year.select(["countries", "family_year"]),
+    df_inventor_frac.select(["countries", "family_year"]),
+    df_inventor_frac_quality.select(["countries", "family_year"]),
+]).unique()
+
+df_country_year = (
+    country_year_keys
+    .join(df_country_year, on=["countries", "family_year"], how="left")
+    .join(df_inventor_frac, on=["countries", "family_year"], how="left")
+    .join(df_inventor_frac_quality, on=["countries", "family_year"], how="left")
+)
+
 # ------------------------------------------------------------------
 # 3. Build complete grid, add 3-digit codes, rank
 # ------------------------------------------------------------------
 df_complete = build_complete_grid(
     df_country_year, "countries", "family_year", VALUE_COLS, YEAR_RANGE,
-    zero_fill_cols=["num_patents", "total_citations_5yr"],
+    zero_fill_cols=["num_patents", "inventor_frac_patents", "total_citations_5yr"],
 )
 df_complete = add_country_3digit(df_complete, "countries")
 
 df_complete = df_complete.with_columns([
+    pl.col("num_patents").alias("whole_count_patents"),
+    pl.col("country_pqi_hall").alias("whole_count_pqi_hall"),
+    pl.col("country_pqi_oecd").alias("whole_count_pqi_oecd"),
+    pl.col("inventor_frac_patents").alias("inventor_fractional_count_patents"),
+    pl.col("inventor_frac_pqi_hall").alias("inventor_fractional_pqi_hall"),
+    pl.col("inventor_frac_pqi_oecd").alias("inventor_fractional_pqi_oecd"),
     pl.when(pl.col("country_pqi_hall") > 0)
     .then(
         pl.col("country_pqi_hall")

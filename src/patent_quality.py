@@ -101,64 +101,200 @@ else:
 # ============================================================================
 
 print("\nLoading green patent data ...")
-green = pl.read_parquet("PATSTAT2025FALL/output/green_patent8526.parquet")
+GREEN_FAMILY_PATH = Path("PATSTAT2025FALL/output/green_patent_family8526.parquet")
+if GREEN_FAMILY_PATH.exists():
+    print(f"  Using family-level table: {GREEN_FAMILY_PATH}")
+    green = pl.read_parquet(GREEN_FAMILY_PATH)
+else:
+    print("  Family-level table not found; falling back to green_patent8526.parquet")
+    green = pl.read_parquet("PATSTAT2025FALL/output/green_patent8526.parquet")
 
-green_families = (
-    green
-    .with_columns(
-        pl.col("earliest_filing_date")
-        .str.slice(0, 4)
-        .cast(pl.Int16)
-        .alias("family_year"),
-    )
-    .group_by("docdb_family_id")
-    .agg([
-        pl.col("family_year").min(),
-        pl.col("docdb_family_size").max().alias("family_size"),
-        pl.col("publn_claims").max().alias("claims"),
-    ])
-)
+green_families = green.with_columns(
+    pl.when(pl.col("year").is_not_null())
+    .then(pl.col("year").cast(pl.Int16))
+    .otherwise(pl.col("earliest_filing_date").str.slice(0, 4).cast(pl.Int16))
+    .alias("family_year")
+).select([
+    "docdb_family_id",
+    "family_year",
+    pl.col("docdb_family_size").alias("family_size"),
+    pl.col("publn_claims").alias("claims"),
+])
+green_family_ids = green_families.select("docdb_family_id")
 
-# Countries per family — prioritise person_ctry_code (inventor country);
-# fall back to appln_auth (filing office) for applications without person data.
+# Countries per family.
+# ``countries`` keeps the existing whole-count country-presence workflow.
+# New inventor/applicant contribution tables keep multiplicity for fractional
+# counting: e.g. 2 inventors from A and 1 from B => A=2/3, B=1/3.
 REGIONAL_OFFICES = {"EP", "WO", "EA", "OA", "AP", "GC", "BX"}
+INVALID_COUNTRY_CODES = {"0", "00", ""}
+INVENTOR_COUNTRY_CONTRIB = Path("PATSTAT2025FALL/output/inventor_country_contrib_family.parquet")
+APPLICANT_COUNTRY_CONTRIB = Path("PATSTAT2025FALL/output/applicant_country_contrib_family.parquet")
 
-# Applications WITH person_ctry_code
-with_person = (
-    green
-    .select(["docdb_family_id", "person_ctry_code"])
-    .filter(pl.col("person_ctry_code").is_not_null() & (pl.col("person_ctry_code") != ""))
-    .with_columns(pl.col("person_ctry_code").str.split(","))
-    .explode("person_ctry_code")
-    .with_columns(pl.col("person_ctry_code").str.strip_chars().alias("country"))
-    .filter(pl.col("country") != "")
-    .select(["docdb_family_id", "country"])
-)
 
-# Applications WITHOUT person_ctry_code
-without_person = (
-    green
-    .select(["docdb_family_id", "appln_auth", "person_ctry_code"])
-    .filter(pl.col("person_ctry_code").is_null() | (pl.col("person_ctry_code") == ""))
-    .filter(
-        pl.col("appln_auth").is_not_null()
-        & (pl.col("appln_auth") != "")
-        & (~pl.col("appln_auth").is_in(list(REGIONAL_OFFICES)))
+def valid_country_expr() -> pl.Expr:
+    return (
+        pl.col("country").is_not_null()
+        & (pl.col("country") != "")
+        & (pl.col("country").str.len_chars() == 2)
+        & (~pl.col("country").is_in(list(INVALID_COUNTRY_CODES)))
+        & (~pl.col("country").is_in(list(REGIONAL_OFFICES)))
     )
-    .select(["docdb_family_id", pl.col("appln_auth").alias("country")])
+
+
+def empty_country_contrib(prefix: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "docdb_family_id": pl.Int32,
+            "country": pl.Utf8,
+            f"n_{prefix}s_country": pl.Int64,
+            f"n_{prefix}s_total": pl.Int64,
+            f"{prefix}_frac": pl.Float64,
+        }
+    )
+
+
+def load_country_contrib(path: Path, prefix: str) -> pl.DataFrame:
+    if not path.exists():
+        print(f"  Missing {path.name}; falling back to whole-count country lists")
+        return empty_country_contrib(prefix)
+
+    return (
+        pl.read_parquet(path)
+        .with_columns(pl.col("country").str.strip_chars().str.to_uppercase())
+        .filter(valid_country_expr())
+        .join(green_family_ids, on="docdb_family_id", how="semi")
+    )
+
+
+def countries_from_green_list(source_col: str, out_col: str) -> pl.DataFrame:
+    if source_col not in green.columns:
+        return pl.DataFrame(
+            schema={"docdb_family_id": pl.Int32, out_col: pl.List(pl.Utf8)}
+        )
+
+    return (
+        green
+        .select(["docdb_family_id", source_col])
+        .filter(pl.col(source_col).is_not_null() & (pl.col(source_col) != ""))
+        .with_columns(pl.col(source_col).str.split(","))
+        .explode(source_col)
+        .with_columns(pl.col(source_col).str.strip_chars().str.to_uppercase().alias("country"))
+        .filter(valid_country_expr())
+        .group_by("docdb_family_id")
+        .agg(pl.col("country").unique().sort().alias(out_col))
+    )
+
+
+def country_list_from_contrib(contrib: pl.DataFrame, out_col: str) -> pl.DataFrame:
+    if contrib.is_empty():
+        return pl.DataFrame(
+            schema={"docdb_family_id": pl.Int32, out_col: pl.List(pl.Utf8)}
+        )
+
+    return (
+        contrib
+        .group_by("docdb_family_id")
+        .agg(pl.col("country").unique().sort().alias(out_col))
+    )
+
+
+inventor_country_contrib = load_country_contrib(INVENTOR_COUNTRY_CONTRIB, "inventor")
+applicant_country_contrib = load_country_contrib(APPLICANT_COUNTRY_CONTRIB, "applicant")
+
+inventor_country_by_family = country_list_from_contrib(
+    inventor_country_contrib, "inventor_countries"
+)
+if inventor_country_by_family.is_empty():
+    source_col = "inventor_country_list" if "inventor_country_list" in green.columns else "person_ctry_code"
+    inventor_country_by_family = countries_from_green_list(source_col, "inventor_countries")
+
+applicant_country_by_family = country_list_from_contrib(
+    applicant_country_contrib, "applicant_countries"
+)
+if applicant_country_by_family.is_empty():
+    applicant_country_by_family = countries_from_green_list(
+        "applicant_country_list", "applicant_countries"
+    )
+
+if "appln_auths" in green.columns:
+    fallback_country_by_family = (
+        green
+        .select(["docdb_family_id", "appln_auths"])
+        .join(inventor_country_by_family.select("docdb_family_id"), on="docdb_family_id", how="anti")
+        .filter(pl.col("appln_auths").is_not_null() & (pl.col("appln_auths") != ""))
+        .with_columns(pl.col("appln_auths").str.split(","))
+        .explode("appln_auths")
+        .select(["docdb_family_id", pl.col("appln_auths").str.to_uppercase().alias("country")])
+        .filter(valid_country_expr())
+        .group_by("docdb_family_id")
+        .agg(pl.col("country").unique().sort().alias("countries"))
+    )
+else:
+    family_earliest_auth = (
+        green
+        .select(["docdb_family_id", "earliest_filing_date", "appln_auth"])
+        .filter(
+            pl.col("appln_auth").is_not_null()
+            & (pl.col("appln_auth") != "")
+            & (~pl.col("appln_auth").is_in(list(REGIONAL_OFFICES)))
+        )
+        .sort(["docdb_family_id", "earliest_filing_date"])
+        .group_by("docdb_family_id")
+        .agg(pl.col("appln_auth").first().str.to_uppercase().alias("country"))
+        .filter(valid_country_expr())
+    )
+    fallback_country_by_family = (
+        family_earliest_auth
+        .join(inventor_country_by_family.select("docdb_family_id"), on="docdb_family_id", how="anti")
+        .group_by("docdb_family_id")
+        .agg(pl.col("country").unique().sort().alias("countries"))
+    )
+
+total_green_families = green_families.height
+families_with_inventor_country = inventor_country_by_family["docdb_family_id"].n_unique()
+families_with_applicant_country = applicant_country_by_family["docdb_family_id"].n_unique()
+missing_inventor_country = total_green_families - families_with_inventor_country
+missing_applicant_country = total_green_families - families_with_applicant_country
+inventor_attrition_rate = missing_inventor_country / total_green_families
+applicant_attrition_rate = missing_applicant_country / total_green_families
+fallback_families = fallback_country_by_family.height
+fallback_coverage_rate = (
+    fallback_families / missing_inventor_country
+    if missing_inventor_country > 0
+    else 0.0
 )
 
-n_total_apps = green.height
-n_with = green.filter(
-    pl.col("person_ctry_code").is_not_null() & (pl.col("person_ctry_code") != "")
-).height
-print(f"  Country source: person_ctry_code {n_with}/{n_total_apps} apps "
-      f"({n_with/n_total_apps*100:.1f}%), appln_auth fallback for the rest")
+country_by_family = pl.concat(
+    [
+        inventor_country_by_family.rename({"inventor_countries": "countries"}),
+        fallback_country_by_family,
+    ],
+    how="vertical",
+)
 
-country_by_family = (
-    pl.concat([with_person, without_person])
-    .group_by("docdb_family_id")
-    .agg(pl.col("country").unique().alias("countries"))
+print(
+    f"  Country source: inventor countries for "
+    f"{families_with_inventor_country}/{total_green_families} families; "
+    f"appln_auth fallback for {fallback_families}"
+)
+print(
+    f"  Applicant countries available for "
+    f"{families_with_applicant_country}/{total_green_families} families"
+)
+print("  Country attribution attrition among green patent families:")
+print(
+    f"    Inventor country missing: {missing_inventor_country}/{total_green_families} "
+    f"({inventor_attrition_rate:.2%})"
+)
+print(
+    f"    Applicant country missing: {missing_applicant_country}/{total_green_families} "
+    f"({applicant_attrition_rate:.2%})"
+)
+print(
+    f"    Earliest appln_auth fallback covers {fallback_families}/{missing_inventor_country} "
+    f"missing-inventor families ({fallback_coverage_rate:.2%}); "
+    "fallback is used only for whole-count countries, not role fractional counts"
 )
 
 # Technology field per family (first character of first IPC code → A–H section)
@@ -444,6 +580,8 @@ df_family = (
     )
     .join(tech_field_by_family, on="docdb_family_id", how="left")
     .join(country_by_family, on="docdb_family_id", how="left")
+    .join(inventor_country_by_family, on="docdb_family_id", how="left")
+    .join(applicant_country_by_family, on="docdb_family_id", how="left")
     .with_columns([
         pl.col("fwd_citations_5yr").fill_null(0),
         pl.col("generality").fill_null(0.0),
@@ -562,6 +700,59 @@ print(f"  Family-level quality data saved to patent_quality_family.parquet")
 
 print("\nAggregating to country level …")
 
+
+def fractional_country_quality(contrib: pl.DataFrame, prefix: str) -> pl.DataFrame:
+    frac_col = f"{prefix}_frac"
+    if contrib.is_empty():
+        return pl.DataFrame(
+            schema={
+                "countries": pl.Utf8,
+                f"{prefix}_frac_patents": pl.Float64,
+                f"{prefix}_frac_pqi_hall": pl.Float64,
+                f"{prefix}_frac_pqi_oecd": pl.Float64,
+                f"{prefix}_families_with_country": pl.Int64,
+            }
+        )
+
+    base_cols_to_drop = [
+        col
+        for col in ["countries", "inventor_countries", "applicant_countries"]
+        if col in df_with_cohort.columns
+    ]
+
+    weighted = (
+        df_with_cohort
+        .drop(base_cols_to_drop)
+        .join(
+            contrib.select(["docdb_family_id", "country", frac_col]),
+            on="docdb_family_id",
+            how="inner",
+        )
+        .rename({"country": "countries"})
+        .with_columns([
+            (pl.col("patent_quality_index_4") * pl.col(frac_col)).alias("_weighted_pqi_hall"),
+            (pl.col("patent_quality_index_4_oecd") * pl.col(frac_col)).alias("_weighted_pqi_oecd"),
+        ])
+    )
+
+    return (
+        weighted
+        .group_by("countries")
+        .agg([
+            pl.col(frac_col).sum().alias(f"{prefix}_frac_patents"),
+            (
+                pl.col("_weighted_pqi_hall").sum()
+                / pl.col(frac_col).sum()
+            ).alias(f"{prefix}_frac_pqi_hall"),
+            (
+                pl.col("_weighted_pqi_oecd").sum()
+                / pl.col(frac_col).sum()
+            ).alias(f"{prefix}_frac_pqi_oecd"),
+            pl.col("docdb_family_id").n_unique().alias(f"{prefix}_families_with_country"),
+        ])
+    )
+
+
 df_country_patents = (
     df_with_cohort.explode("countries")
     .filter(pl.col("countries").is_not_null() & (pl.col("countries") != ""))
@@ -602,6 +793,34 @@ df_country_quality = (
         pl.col("family_year").min().alias("earliest_year"),
         pl.col("family_year").max().alias("latest_year"),
     ])
+)
+
+inventor_fractional_quality = fractional_country_quality(
+    inventor_country_contrib, "inventor"
+)
+applicant_fractional_quality = fractional_country_quality(
+    applicant_country_contrib, "applicant"
+)
+
+df_country_quality = (
+    df_country_quality
+    .join(inventor_fractional_quality, on="countries", how="left")
+    .join(applicant_fractional_quality, on="countries", how="left")
+    .with_columns([
+        pl.col("inventor_frac_patents").fill_null(0.0),
+        pl.col("applicant_frac_patents").fill_null(0.0),
+        pl.col("inventor_families_with_country").fill_null(0),
+        pl.col("applicant_families_with_country").fill_null(0),
+        pl.col("num_patents").alias("whole_count_patents"),
+        pl.col("country_patent_quality_index").alias("whole_count_pqi_hall"),
+        pl.col("country_pqi_oecd").alias("whole_count_pqi_oecd"),
+        pl.col("inventor_frac_patents").alias("inventor_fractional_count_patents"),
+        pl.col("inventor_frac_pqi_hall").alias("inventor_fractional_pqi_hall"),
+        pl.col("inventor_frac_pqi_oecd").alias("inventor_fractional_pqi_oecd"),
+        pl.col("applicant_frac_patents").alias("applicant_fractional_count_patents"),
+        pl.col("applicant_frac_pqi_hall").alias("applicant_fractional_pqi_hall"),
+        pl.col("applicant_frac_pqi_oecd").alias("applicant_fractional_pqi_oecd"),
+    ])
     .sort("country_pqi_oecd", descending=True)
 )
 
@@ -616,14 +835,55 @@ print("=" * 80)
 print(
     df_country_quality.select([
         "quality_rank", "countries", "country_patent_quality_index",
-        "country_pqi_oecd",
-        "num_patents", "avg_forward_cites_5yr", "avg_family_size",
+        "country_pqi_oecd", "num_patents", "inventor_frac_patents",
+        "applicant_frac_patents", "avg_forward_cites_5yr", "avg_family_size",
         "avg_claims", "avg_generality", "avg_generality_oecd",
     ]).head(20)
 )
 
 print(f"\nTotal countries analysed: {len(df_country_quality)}")
 print(f"Total patent families: {df_country_quality['num_patents'].sum()}")
+
+pqi_compare = (
+    df_country_quality
+    .filter(
+        pl.col("country_pqi_oecd").is_not_null()
+        & pl.col("inventor_frac_pqi_oecd").is_not_null()
+        & (pl.col("inventor_frac_patents") > 0)
+    )
+    .with_columns([
+        (pl.col("inventor_frac_pqi_oecd") - pl.col("country_pqi_oecd"))
+        .alias("inventor_minus_whole_pqi_oecd"),
+        (pl.col("inventor_frac_pqi_oecd") - pl.col("country_pqi_oecd"))
+        .abs()
+        .alias("abs_diff_pqi_oecd"),
+    ])
+)
+
+print("\nWhole-count vs inventor-fractional OECD PQI:")
+print(
+    pqi_compare.select([
+        pl.len().alias("countries_compared"),
+        pl.col("inventor_minus_whole_pqi_oecd").mean().alias("mean_diff"),
+        pl.col("abs_diff_pqi_oecd").mean().alias("mean_abs_diff"),
+        pl.col("abs_diff_pqi_oecd").median().alias("median_abs_diff"),
+        pl.col("abs_diff_pqi_oecd").max().alias("max_abs_diff"),
+    ])
+)
+print(
+    pqi_compare
+    .select([
+        "countries",
+        "country_pqi_oecd",
+        "inventor_frac_pqi_oecd",
+        "inventor_minus_whole_pqi_oecd",
+        "abs_diff_pqi_oecd",
+        "num_patents",
+        "inventor_frac_patents",
+    ])
+    .sort("abs_diff_pqi_oecd", descending=True)
+    .head(10)
+)
 
 print("\nMethodology:")
 print("  Forward citations : 5-year window from earliest filing date (TLS228)")
@@ -632,6 +892,7 @@ print("  Generality (OECD) : 1 − Σ[(1/N) Σ β_ji]²; β_ji = CPC-share weigh
 print("  Normalisation     : Winsorised at p99 within (year × IPC section) cohorts")
 print("  Quality index     : Equal-weighted average of 4 normalised components")
 print("  Country aggregation: Mean of family-level quality indices")
+print("  Fractional counts : Inventor/applicant country shares from TLS207 role links")
 
 df_country_quality.write_csv("PATSTAT2025FALL/output/oecd_patent_quality_country_rankings.csv")
 print("\nResults exported to: oecd_patent_quality_country_rankings.csv")

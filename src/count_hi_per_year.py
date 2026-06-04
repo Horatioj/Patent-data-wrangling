@@ -11,6 +11,7 @@ from patent_count_utils import (
     INVALID_COUNTRY_CODES,
     build_complete_grid,
     add_country_3digit,
+    inventor_fractional_country_year,
     print_summary,
 )
 
@@ -45,12 +46,13 @@ with_person = (
 without_person = (
     base
     .filter(pl.col("person_ctry_code").is_null() | (pl.col("person_ctry_code") == ""))
+    .join(pl.read_parquet("PATSTAT2025FALL/output/docdb_family_country.parquet"), on="docdb_family_id", how="inner")
     .filter(
-        pl.col("appln_auth").is_not_null()
-        & (~pl.col("appln_auth").is_in(list(INVALID_COUNTRY_CODES)))
-        & (~pl.col("appln_auth").is_in(list(REGIONAL_OFFICES)))
+        pl.col("country").is_not_null()
+        & (~pl.col("country").is_in(list(INVALID_COUNTRY_CODES)))
+        & (~pl.col("country").is_in(list(REGIONAL_OFFICES)))
     )
-    .select(["docdb_family_id", pl.col("appln_auth").alias("countries"), "family_year"])
+    .select(["docdb_family_id", pl.col("country").alias("countries"), "family_year"])
 )
 
 n_with = base.filter(
@@ -70,13 +72,43 @@ df_country_year = (
     .agg(pl.col("docdb_family_id").n_unique().alias("num_hi_patents"))
 )
 
+hi_family_year = (
+    base
+    .group_by("docdb_family_id")
+    .agg(pl.col("family_year").min())
+)
+df_inventor_frac = inventor_fractional_country_year(
+    hi_family_year,
+    "family_year",
+    "inventor_frac_hi_patents",
+)
+
+country_year_keys = pl.concat([
+    df_country_year.select(["countries", "family_year"]),
+    df_inventor_frac.select(["countries", "family_year"]),
+]).unique()
+
+df_country_year = (
+    country_year_keys
+    .join(df_country_year, on=["countries", "family_year"], how="left")
+    .join(df_inventor_frac, on=["countries", "family_year"], how="left")
+)
+
 # ------------------------------------------------------------------
 # 4. Build complete grid and add 3-digit codes
 # ------------------------------------------------------------------
 df_complete = build_complete_grid(
-    df_country_year, "countries", "family_year", ["num_hi_patents"], YEAR_RANGE
+    df_country_year,
+    "countries",
+    "family_year",
+    ["num_hi_patents", "inventor_frac_hi_patents"],
+    YEAR_RANGE,
 )
 df_complete = add_country_3digit(df_complete, "countries")
+df_complete = df_complete.with_columns([
+    pl.col("num_hi_patents").alias("whole_count_hi_patents"),
+    pl.col("inventor_frac_hi_patents").alias("inventor_fractional_count_hi_patents"),
+])
 
 # ------------------------------------------------------------------
 # 5. Summary and export

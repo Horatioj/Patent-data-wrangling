@@ -3,7 +3,7 @@ Green patent analysis — applicants, influential patents, network science.
 
 Sections:
   D. Applicant / inventor analysis  (companies, universities, gov, individuals)
-       — harmonised names via han_id/han_name; TW excluded
+       — harmonised names via han_id/han_name
   E. Most influential green patents
        — forward citations, OECD quality index, family size, PageRank
        — scientific scatter-bubble figure
@@ -40,8 +40,11 @@ import scipy.stats as stats
 
 warnings.filterwarnings("ignore")
 matplotlib.rcParams.update({
-    "font.family": "DejaVu Sans",
-    "font.sans-serif": ["Helvetica"],
+    # Real font names as a list → per-glyph fallback (mpl ≥3.6): Latin in
+    # DejaVu Sans, CJK applicant names (e.g. パナソニック, 比亚迪, 현대) fall back
+    # to JP/CN/KR fonts instead of rendering as tofu boxes.
+    "font.family": ["DejaVu Sans", "Yu Gothic", "Meiryo", "Microsoft YaHei",
+                    "MS Gothic", "Malgun Gothic", "SimHei"],
     "axes.spines.top": False,
     "axes.spines.right": False,
     "axes.grid": True,
@@ -53,8 +56,6 @@ matplotlib.rcParams.update({
 OUT = "PATSTAT2025FALL/output/vis"
 os.makedirs(OUT, exist_ok=True)
 
-EXCLUDE_CTRY = {"TW"}   # exclude Taiwan per user request
-
 SECTOR_COLOR = {
     "Energy":           "#2a9d8f",
     "Transportation":   "#264653",
@@ -65,9 +66,12 @@ SECTOR_COLOR = {
     "Agriculture":      "#f4a261",
     "CCS":              "#a8dadc",
     "Mixed":            "#a8a8a8",
+    "Other":            "#9aa0a6",   # patents with no assigned sector
 }
 SECTORS_ORDERED = ["Energy", "Transportation", "Manufacturing", "Buildings",
                    "ICT", "Waste management", "Agriculture"]
+# Includes the catch-all "Other" bucket for legends on family-level figures
+SECTORS_PLUS = SECTORS_ORDERED + ["Other"]
 
 ENTITY_COLOR = {
     "Company":        "#264653",
@@ -82,9 +86,7 @@ ENTITY_COLOR = {
 # 0. Load data
 # ═══════════════════════════════════════════════════════════════════════════
 print("Loading green_patent8526.parquet …")
-green = pl.read_parquet("PATSTAT2025FALL/output/green_patent8526.parquet").filter(
-    ~pl.col("appln_auth").is_in(list(EXCLUDE_CTRY))
-).with_columns(
+green = pl.read_parquet("PATSTAT2025FALL/output/green_patent8526.parquet").with_columns(
     pl.col("appln_filing_date").str.slice(0, 4).cast(pl.Int32).alias("yr")
 )
 
@@ -130,9 +132,35 @@ green = green.with_columns(
     .alias("entity_type")
 )
 
-# Primary sector per patent (first comma-delimited entry)
+# Primary sector per patent (first comma-delimited entry); empty/missing → "Other"
 green = green.with_columns(
     pl.col("sector").str.split(",").list.first().str.strip_chars().alias("primary_sector")
+).with_columns(
+    pl.when(pl.col("primary_sector").is_null() | (pl.col("primary_sector") == ""))
+      .then(pl.lit("Other"))
+      .otherwise(pl.col("primary_sector"))
+      .alias("primary_sector")
+)
+
+# ── Family-level representative record (earliest-filed application per family) ──
+# Used by E1/E2 so the reported year is the family's EARLIEST filing year and the
+# identifiers (publn_nr, appln_nr_original, …) point to a real, findable document.
+_rep = green.with_columns(
+    pl.col("earliest_filing_date").str.slice(0, 4).cast(pl.Int32, strict=False)
+      .fill_null(pl.col("appln_filing_date").str.slice(0, 4).cast(pl.Int32, strict=False))
+      .alias("_file_year")
+)
+fam_year = _rep.group_by("docdb_family_id").agg(pl.col("_file_year").min().alias("family_year"))
+rep = (
+    _rep
+    .sort(["docdb_family_id", "earliest_filing_date", "appln_filing_date", "appln_id"])
+    .unique(subset="docdb_family_id", keep="first", maintain_order=True)
+    .select(["docdb_family_id", "appln_id", "appln_auth", "appln_kind",
+             "appln_nr_original", "publn_nr", "earliest_pat_publn_id",
+             "earliest_filing_date", "appln_title", "primary_sector", "entity_type"])
+    .join(fam_year, on="docdb_family_id", how="left")
+    # Espacenet/Google-Patents-friendly publication string (office + number)
+    .with_columns((pl.col("appln_auth") + pl.col("publn_nr").fill_null("")).alias("pub_number"))
 )
 
 
@@ -170,8 +198,7 @@ ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x)}k"))
 ax.set_xlim(YEAR_MIN - 0.5, YEAR_MAX + 0.5)
 ax.legend(loc="upper left", fontsize=9, ncol=2)
 plt.title(
-    "Green Patent Applications by Applicant Type 1990–2023\n"
-    "(Harmonised via han_id; TW excluded)",
+    "Green Patent Applications by Applicant Type 1985–2025",
     fontsize=11, pad=10,
 )
 fig.tight_layout()
@@ -231,39 +258,51 @@ univs_raw = (
     .to_pandas()
 )
 
-fig, (ax_c, ax_u) = plt.subplots(1, 2, figsize=(16, 6))
+fig, (ax_c, ax_u) = plt.subplots(1, 2, figsize=(17, 7))
 
-def dot_chart(ax, df, label, color_field="main_sector"):
+def dot_chart(ax, df, label):
     df = df.head(15).copy()
-    df["entity_short"] = df["entity"].str[:35]
+    df["entity_short"] = df["entity"].str.slice(0, 42)
     y = np.arange(len(df))
     # Dot size ~ total citations
-    sizes = (df["total_cit"] / df["total_cit"].max() * 400 + 30).values
-    colors = [SECTOR_COLOR.get(s, "#aaa") for s in df.get("main_sector", [""] * len(df))]
-    ax.scatter(df["n_families"], y, s=sizes, c=colors, zorder=3, alpha=0.85)
+    sizes = (df["total_cit"] / df["total_cit"].max() * 420 + 45).values
+    colors = [SECTOR_COLOR.get(s, "#aaa") for s in df["main_sector"]]
+    ax.scatter(df["n_families"], y, s=sizes, c=colors, zorder=3, alpha=0.88,
+               edgecolors="white", linewidths=0.6)
     ax.set_yticks(y)
-    ax.set_yticklabels(df["entity_short"], fontsize=8)
-    ax.set_xlabel("Unique green patent families", fontsize=9)
-    ax.set_title(label, fontsize=10, pad=8)
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x/1000)}k" if x >= 1000 else str(int(x))))
-    # Legend for sectors
-    handles = [mpatches.Patch(color=SECTOR_COLOR.get(s, "#aaa"), label=s) for s in SECTORS_ORDERED if s in df.get("main_sector", []).values]
-    ax.legend(handles=handles[:5], fontsize=7, loc="lower right")
+    ax.set_yticklabels(df["entity_short"], fontsize=9)
+    ax.set_xlabel("Unique green patent families", fontsize=10)
+    ax.set_title(label, fontsize=11, pad=8)
+    ax.xaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"{int(x/1000)}k" if x >= 1000 else str(int(x))))
+    ax.margins(x=0.22)          # leave room for long entity names / dots
     ax.invert_yaxis()
+    return set(df["main_sector"])
 
-dot_chart(ax_c, companies_raw, "Top 15 Companies — Green Patent Families")
-dot_chart(ax_u, univs_raw,   "Top 15 Universities — Green Patent Families")
+secs = set()
+secs |= dot_chart(ax_c, companies_raw, "Top 15 Companies — Green Patent Families")
+secs |= dot_chart(ax_u, univs_raw,     "Top 15 Universities — Green Patent Families")
 
-# Global legend: dot size = citations
-for size, label in [(50, "Low cit."), (200, "Med cit."), (430, "High cit.")]:
-    ax_c.scatter([], [], s=size, color="#aaa", alpha=0.7, label=label)
-ax_c.legend(fontsize=7, title="Citation weight", title_fontsize=7)
+# Shared sector legend (colour) below the panels — avoids overlapping the dots
+present_secs = [s for s in SECTORS_ORDERED if s in secs]
+sector_handles = [mpatches.Patch(color=SECTOR_COLOR.get(s, "#aaa"), label=s)
+                  for s in present_secs]
+fig.legend(handles=sector_handles, loc="lower center", ncol=len(sector_handles) or 1,
+           fontsize=9, frameon=False, title="Primary sector (dot colour)",
+           title_fontsize=9, bbox_to_anchor=(0.5, -0.03))
+
+# Separate size legend (dot size = citation weight) on the company panel
+size_handles = [ax_c.scatter([], [], s=s, color="#bbb", alpha=0.8,
+                             edgecolors="white", linewidths=0.6, label=lbl)
+                for s, lbl in [(60, "Low"), (240, "Medium"), (460, "High")]]
+ax_c.legend(handles=size_handles, fontsize=8, loc="lower right",
+            title="Citations (dot size)", title_fontsize=8, framealpha=0.85)
 
 fig.suptitle(
-    "Top Green Patent Applicants — Harmonised Entities (TW excluded)",
-    fontsize=12, y=1.01,
+    "Top Green Patent Applicants — Harmonised Entities",
+    fontsize=13, y=1.0,
 )
-fig.tight_layout()
+fig.tight_layout(rect=[0, 0.05, 1, 1])
 fig.savefig(f"{OUT}/D2_top_applicants.png", bbox_inches="tight")
 plt.close()
 print("Saved D2_top_applicants.png")
@@ -342,7 +381,7 @@ ax.set_ylabel("Share of green applications (%)", fontsize=10)
 ax.set_ylim(0, 100)
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
 ax.legend(fontsize=9, loc="upper right")
-plt.title("Applicant Type Composition per Country (TW excluded)", fontsize=11, pad=10)
+plt.title("Applicant Type Composition per Country", fontsize=11, pad=10)
 fig.tight_layout()
 fig.savefig(f"{OUT}/D4_country_entity_type.png")
 plt.close()
@@ -355,14 +394,13 @@ print("Saved D4_country_entity_type.png")
 #     Size = family size           |  Color = primary sector
 #     (Dechezlepretre-style scatter)
 # ═══════════════════════════════════════════════════════════════════════════
-green_fam = green.unique(subset=["docdb_family_id"])
 green_q = (
-    green_fam
+    rep
     .join(pq, on="docdb_family_id", how="inner")
     .join(pr, on="docdb_family_id", how="left")
     .filter(pl.col("fwd_citations_5yr") > 0)
     .filter(pl.col("patent_quality_index_4").is_not_null())
-    .filter(pl.col("primary_sector").is_in(SECTORS_ORDERED))
+    .filter(pl.col("primary_sector").is_in(SECTORS_PLUS))
     .sort("fwd_citations_5yr", descending=True)
     .head(200000)   # use top-200k to keep plot readable
     .to_pandas()
@@ -376,7 +414,7 @@ green_q_plot = green_q[(green_q["fwd_citations_5yr"] <= c99) &
 
 # Top-30 high-influence labelled points
 top30 = (
-    green.unique(subset=["docdb_family_id"])
+    rep
     .join(pq, on="docdb_family_id", how="inner")
     .join(pr, on="docdb_family_id", how="left")
     .filter(pl.col("category") == "H")
@@ -385,58 +423,70 @@ top30 = (
     .to_pandas()
 )
 
-fig, ax = plt.subplots(figsize=(12, 8))
+rng = np.random.default_rng(7)
+fig, ax = plt.subplots(figsize=(15, 8))
 
-for sec in SECTORS_ORDERED:
-    mask = green_q_plot["primary_sector"] == sec
-    sub = green_q_plot[mask]
-    sz = np.clip(sub["family_size"].values * 1.5, 3, 60)
-    ax.scatter(sub["fwd_citations_5yr"], sub["patent_quality_index_4"],
-               s=sz, c=SECTOR_COLOR[sec], alpha=0.18, rasterized=True, label=sec)
+# Background: sector-coloured cloud (sampled + x-jittered to break the integer
+# citation banding that made the previous version look striped/cluttered).
+bg = green_q_plot.sample(45000, random_state=7) if len(green_q_plot) > 45000 else green_q_plot
+for sec in SECTORS_PLUS:
+    sub = bg[bg["primary_sector"] == sec]
+    if sub.empty:
+        continue
+    xj = sub["fwd_citations_5yr"].values + rng.uniform(-0.45, 0.45, len(sub))
+    ax.scatter(xj, sub["patent_quality_index_4"], s=5,
+               c=SECTOR_COLOR[sec], alpha=0.16, rasterized=True, label=sec)
 
-# Overlay top-30 H patents
+# Overlay top-30 H patents (black-bordered)
 for _, row in top30.iterrows():
-    sec = str(row.get("primary_sector", "Energy")).split(",")[0].strip()
-    c = SECTOR_COLOR.get(sec, "#264653")
+    sec = str(row.get("primary_sector", "Other")).split(",")[0].strip()
     ax.scatter(row["fwd_citations_5yr"], row["patent_quality_index_4"],
-               s=max(30, row.get("family_size", 5) * 3), c=c, alpha=0.95,
-               edgecolors="black", linewidths=0.8, zorder=5)
+               s=max(40, row.get("family_size", 5) * 3),
+               c=SECTOR_COLOR.get(sec, SECTOR_COLOR["Other"]), alpha=0.95,
+               edgecolors="black", linewidths=0.9, zorder=5)
 
-# Label the very top-10 by PageRank
-top10_label = top30.sort_values("pagerank", ascending=False).head(10)
-for _, row in top10_label.iterrows():
-    title = str(row.get("appln_title", ""))[:28] + "…" if len(str(row.get("appln_title", ""))) > 28 else str(row.get("appln_title", ""))
-    ax.annotate(
-        f"{row['appln_auth']} {row['yr']}\n{title}",
-        xy=(row["fwd_citations_5yr"], row["patent_quality_index_4"]),
-        xytext=(10, 5), textcoords="offset points",
-        fontsize=6.5, color="#222",
-        arrowprops=dict(arrowstyle="-", color="#999", lw=0.7),
-        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#ccc", alpha=0.85),
-        zorder=6,
-    )
+# Number the top-10 by PageRank on the plot, and list them in a side panel
+# (replaces the previous overlapping label boxes, which were unreadable).
+top10_label = top30.sort_values("pagerank", ascending=False).head(10).reset_index(drop=True)
+list_lines = []
+for i, row in top10_label.iterrows():
+    n = i + 1
+    ax.annotate(str(n),
+                xy=(row["fwd_citations_5yr"], row["patent_quality_index_4"]),
+                xytext=(4, 4), textcoords="offset points",
+                fontsize=8, fontweight="bold", color="#111", zorder=7,
+                path_effects=[pe.withStroke(linewidth=2.0, foreground="white")])
+    title = str(row.get("appln_title", "") or "")
+    title = (title[:34] + "…") if len(title) > 34 else title
+    fy = row["family_year"]
+    fy = f"{int(fy)}" if pd.notna(fy) else "----"
+    list_lines.append(f"{n:>2}. {row['appln_auth']} {fy}  {title}")
+
+ax.text(1.015, 0.99, "Top-10 by PageRank\n" + "\n".join(list_lines),
+        transform=ax.transAxes, va="top", ha="left", fontsize=7.5, family="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", fc="#fbfbfb", ec="#cccccc"))
 
 ax.set_xlabel("5-year forward citations (quality signal)", fontsize=10)
 ax.set_ylabel("OECD Patent Quality Index (0–1)", fontsize=10)
-ax.set_xlim(0)
+ax.set_xlim(left=0)
 ax.set_ylim(0, 1.05)
 
-# Quadrant lines
-ax.axvline(np.percentile(green_q["fwd_citations_5yr"], 75), color="#ccc", lw=0.8, ls="--")
-ax.axhline(np.percentile(green_q["patent_quality_index_4"], 75), color="#ccc", lw=0.8, ls="--")
-ax.text(c99 * 0.72, 0.97, "High-influence zone", fontsize=8, color="#888", ha="right")
+# Quadrant lines (75th pct) + zone label
+ax.axvline(np.percentile(green_q["fwd_citations_5yr"], 75), color="#bbb", lw=0.8, ls="--")
+ax.axhline(np.percentile(green_q["patent_quality_index_4"], 75), color="#bbb", lw=0.8, ls="--")
+ax.text(0.985, 0.965, "High-influence zone", transform=ax.transAxes,
+        fontsize=8.5, color="#999", ha="right", style="italic")
 
-handles = [mpatches.Patch(color=SECTOR_COLOR[s], label=s) for s in SECTORS_ORDERED]
-ax.legend(handles=handles, fontsize=8, ncol=2, loc="upper left",
-          title="Sector (dot size = family size)", title_fontsize=7.5)
+handles = [mpatches.Patch(color=SECTOR_COLOR[s], label=s) for s in SECTORS_PLUS]
+ax.legend(handles=handles, fontsize=8, ncol=2, loc="lower right",
+          title="Sector  (dot size = family size)", title_fontsize=8)
 
 plt.title(
     "Most Influential Green Patents — Citations × OECD Quality × Family Size\n"
-    "Black-bordered dots = top-30 High-influence (H) patents by PageRank",
+    "Black-bordered dots = top-30 High-influence (H) by PageRank; numbered = top-10",
     fontsize=11, pad=10,
 )
-fig.tight_layout()
-fig.savefig(f"{OUT}/E1_influential_scatter.png", dpi=150)
+fig.savefig(f"{OUT}/E1_influential_scatter.png", dpi=150, bbox_inches="tight")
 plt.close()
 print("Saved E1_influential_scatter.png")
 
@@ -445,11 +495,11 @@ print("Saved E1_influential_scatter.png")
 # E2. Top-20 influential patents table (combined score)
 # ═══════════════════════════════════════════════════════════════════════════
 top20_combined = (
-    green.unique(subset=["docdb_family_id"])
+    rep
     .join(pq, on="docdb_family_id", how="inner")
     .join(pr, on="docdb_family_id", how="left")
     .filter(pl.col("category") == "H")
-    .filter(pl.col("yr") <= 2021)
+    .filter(pl.col("family_year") <= 2021)
     .with_columns([
         # Normalise each metric to 0-1, then combine
         (pl.col("fwd_citations_5yr") / pl.col("fwd_citations_5yr").max()).alias("n_cit"),
@@ -463,45 +513,64 @@ top20_combined = (
     )
     .sort("composite", descending=True)
     .head(20)
-    .select(["docdb_family_id", "appln_auth", "yr", "primary_sector",
+    # family_year = earliest filing year across the family; identifier columns
+    # (publn_nr, appln_nr_original, pub_number, …) let you look the patent up.
+    .select(["docdb_family_id", "family_year", "primary_sector",
              "fwd_citations_5yr", "patent_quality_index_4", "pagerank",
-             "family_size", "composite", "appln_title"])
+             "family_size", "composite",
+             "appln_auth", "appln_kind", "appln_nr_original", "publn_nr",
+             "pub_number", "earliest_pat_publn_id", "appln_id",
+             "earliest_filing_date", "appln_title"])
     .to_pandas()
 )
 top20_combined.to_csv(f"{OUT}/E2_top20_influential.csv", index=False)
 print("Saved E2_top20_influential.csv")
 
-# Plot top-20 as horizontal dot chart with multi-metric lollipop
-fig, axes = plt.subplots(1, 3, figsize=(16, 7), sharey=True)
+# Plot top-20 as horizontal multi-metric bars.
+fig, axes = plt.subplots(1, 3, figsize=(17, 8), sharey=True)
 metrics = [
-    ("fwd_citations_5yr",       "5yr Forward Citations",    "#2a9d8f"),
-    ("patent_quality_index_4",  "OECD Quality Index (0–1)", "#264653"),
-    ("pagerank",                "PageRank Centrality",       "#e76f51"),
+    ("fwd_citations_5yr",       "5-yr Forward Citations",     "#2a9d8f", False),
+    ("patent_quality_index_4",  "OECD Quality Index (0–1)",   "#264653", False),
+    ("pagerank",                "PageRank Centrality (log)",  "#e76f51", True),
 ]
 labels = (top20_combined["appln_auth"].str[:2] + " "
-          + top20_combined["yr"].astype(str) + " – "
-          + top20_combined["appln_title"].str[:30]).values
+          + top20_combined["family_year"].astype(int).astype(str) + " – "
+          + top20_combined["appln_title"].str[:34]).values
+y = np.arange(len(top20_combined))
 
-for ax, (col, title, color) in zip(axes, metrics):
-    vals = top20_combined[col].values
-    y = np.arange(len(vals))
-    ax.barh(y, vals, color=color, height=0.6, alpha=0.82)
-    ax.set_title(title, fontsize=9)
+for ax, (col, title, color, logx) in zip(axes, metrics):
+    vals = top20_combined[col].values.astype(float)
+    if logx:
+        # PageRank is heavily skewed (one patent dominates) → linear bars made
+        # the rest invisible; a log axis with a small floor shows them all.
+        pos = vals[vals > 0]
+        floor = pos.min() * 0.6 if len(pos) else 1e-6
+        ax.set_xscale("log")
+        ax.set_xlim(left=floor)
+        ax.barh(y, np.clip(vals, floor, None), color=color, height=0.62, alpha=0.85)
+    else:
+        ax.barh(y, vals, color=color, height=0.62, alpha=0.85)
+    ax.set_title(title, fontsize=10)
     ax.invert_yaxis()
-    if ax == axes[0]:
+    ax.tick_params(axis="x", labelsize=8)
+    if ax is axes[0]:
         ax.set_yticks(y)
-        ax.set_yticklabels(labels, fontsize=7)
-    ax.tick_params(axis="x", labelsize=7.5)
+        ax.set_yticklabels(labels, fontsize=8)
 
-# Color rows by sector
-sector_colors = [SECTOR_COLOR.get(s.split(",")[0].strip(), "#aaa") for s in top20_combined["primary_sector"]]
-for i, sc in enumerate(sector_colors):
+# Shade rows by primary sector
+prim = [s.split(",")[0].strip() for s in top20_combined["primary_sector"]]
+for i, sc in enumerate(prim):
     for ax in axes:
-        ax.axhspan(i - 0.45, i + 0.45, alpha=0.06, color=sc, zorder=0)
+        ax.axhspan(i - 0.45, i + 0.45, alpha=0.13, color=SECTOR_COLOR.get(sc, "#aaa"), zorder=0)
 
+present = [s for s in SECTORS_PLUS if s in set(prim)]
+handles = [mpatches.Patch(color=SECTOR_COLOR[s], label=s) for s in present]
+fig.legend(handles=handles, loc="lower center", ncol=len(handles) or 1, fontsize=8.5,
+           frameon=False, title="Row shading = primary sector", title_fontsize=8.5,
+           bbox_to_anchor=(0.5, -0.02))
 fig.suptitle("Top-20 Most Influential Green Patents (Composite Score)\nCitations × OECD Quality × PageRank × Family Size",
-             fontsize=11, y=1.01)
-fig.tight_layout()
+             fontsize=12, y=1.0)
+fig.tight_layout(rect=[0, 0.04, 1, 1])
 fig.savefig(f"{OUT}/E2_top20_influential.png", bbox_inches="tight")
 plt.close()
 print("Saved E2_top20_influential.png")
@@ -696,7 +765,7 @@ ax.text(0.0, 1.02, "Citing (knowledge\nrecipient)", ha="center", fontsize=9, col
 ax.text(1.0, 1.02, "Cited (knowledge\nsource)",    ha="center", fontsize=9, color="#555")
 ax.set_title(
     "Citation Flow Sankey: High-influence (H) · Green (G) · Neighbor (N)\n"
-    "Width proportional to citation count · Total = 22.5M citation edges",
+    f"Width proportional to citation count · Total = {TOTAL/1e6:.1f}M citation edges",
     fontsize=11, pad=14,
 )
 fig.tight_layout()
@@ -767,46 +836,60 @@ print("Saved F4_sector_citation_matrix.png")
 # ═══════════════════════════════════════════════════════════════════════════
 # F5. PageRank × HITS authority: sector comparison scatter
 # ═══════════════════════════════════════════════════════════════════════════
+# Only families that are actually cited have a positive HITS authority; the
+# previous +1e-65 floor for zero-authority families produced a misleading flat
+# line at the bottom of the plot. Keep authority_score > 0 and take clean logs.
 green_pr_hits = (
     green.unique(subset=["docdb_family_id"])
     .join(pr, on="docdb_family_id", how="inner")
-    .join(hits.select(["docdb_family_id","authority_score"]), on="docdb_family_id", how="left")
+    .join(hits.select(["docdb_family_id", "authority_score"]), on="docdb_family_id", how="left")
     .filter(pl.col("primary_sector").is_in(SECTORS_ORDERED))
-    .filter(pl.col("pagerank") > 1e-9)
+    .filter((pl.col("pagerank") > 1e-9) & (pl.col("authority_score") > 0))
+    .with_columns([
+        pl.col("pagerank").log10().alias("log_pr"),
+        pl.col("authority_score").log10().alias("log_auth"),
+    ])
     .to_pandas()
 )
+# Drop the negligible-authority tail (poorly-connected nodes with authority
+# ~1e-55) so the plot focuses on the meaningful range instead of a long streak.
+green_pr_hits = green_pr_hits[
+    green_pr_hits["log_auth"] >= green_pr_hits["log_auth"].max() - 40
+]
 
-fig, ax = plt.subplots(figsize=(10, 7))
+fig, ax = plt.subplots(figsize=(11.5, 7.5))
 for sec in SECTORS_ORDERED:
     sub = green_pr_hits[green_pr_hits["primary_sector"] == sec]
+    if sub.empty:
+        continue
     sub_s = sub.sample(min(5000, len(sub)), random_state=42)
-    ax.scatter(
-        np.log10(sub_s["pagerank"] + 1e-12),
-        np.log10(sub_s["authority_score"] + 1e-65),
-        s=5, c=SECTOR_COLOR[sec], alpha=0.25, rasterized=True, label=sec,
-    )
+    ax.scatter(sub_s["log_pr"], sub_s["log_auth"],
+               s=6, c=SECTOR_COLOR[sec], alpha=0.25, rasterized=True, label=sec)
 
-# Add sector centroids
+# Sector centroids (mean in log space)
 for sec in SECTORS_ORDERED:
     sub = green_pr_hits[green_pr_hits["primary_sector"] == sec]
-    cx = np.log10(sub["pagerank"].mean() + 1e-12)
-    cy = np.log10(sub["authority_score"].mean() + 1e-65)
-    ax.scatter([cx], [cy], s=200, c=SECTOR_COLOR[sec], marker="D",
-               edgecolors="black", linewidths=1, zorder=5)
-    ax.text(cx, cy + 0.5, sec[:6], ha="center", fontsize=8, fontweight="bold",
-            color=SECTOR_COLOR[sec])
+    if sub.empty:
+        continue
+    cx, cy = sub["log_pr"].median(), sub["log_auth"].median()
+    ax.scatter([cx], [cy], s=220, c=SECTOR_COLOR[sec], marker="D",
+               edgecolors="black", linewidths=1.1, zorder=5)
+    ax.text(cx, cy + 0.4, sec[:6], ha="center", fontsize=8.5, fontweight="bold",
+            color="#222", zorder=6,
+            path_effects=[pe.withStroke(linewidth=2.0, foreground="white")])
 
 handles = [mpatches.Patch(color=SECTOR_COLOR[s], label=s) for s in SECTORS_ORDERED]
-ax.legend(handles=handles, fontsize=8, ncol=2, loc="lower right")
-ax.set_xlabel("log₁₀(PageRank)  — overall network influence", fontsize=10)
-ax.set_ylabel("log₁₀(HITS Authority Score)  — knowledge source quality", fontsize=10)
+ax.legend(handles=handles, fontsize=8.5, loc="center left", bbox_to_anchor=(1.01, 0.5),
+          title="Sector", title_fontsize=9, frameon=False)
+ax.set_xlabel("log₁₀(PageRank) — overall network influence", fontsize=10)
+ax.set_ylabel("log₁₀(HITS authority) — knowledge-source strength", fontsize=10)
 plt.title(
     "PageRank vs. HITS Authority by Green Technology Sector\n"
-    "Diamonds = sector centroids · Dechezleprêtre 2015 network science approach",
+    "Diamonds = sector centroids · only cited families (authority > 0)",
     fontsize=11, pad=10,
 )
 fig.tight_layout()
-fig.savefig(f"{OUT}/F5_pagerank_hits_scatter.png", dpi=150)
+fig.savefig(f"{OUT}/F5_pagerank_hits_scatter.png", dpi=150, bbox_inches="tight")
 plt.close()
 print("Saved F5_pagerank_hits_scatter.png")
 
@@ -815,7 +898,7 @@ print("Saved F5_pagerank_hits_scatter.png")
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 65)
-print("APPLICANT & INFLUENCE SUMMARY (TW excluded)")
+print("APPLICANT & INFLUENCE SUMMARY")
 print("=" * 65)
 ent_counts = green["entity_type"].value_counts().to_pandas().set_index("entity_type")
 for e in ENTITY_ORDER:

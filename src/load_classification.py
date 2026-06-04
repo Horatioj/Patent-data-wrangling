@@ -97,7 +97,12 @@ gc.collect()
 # --- Stage 2: save filtered tls207 to parquet (semi-join shrinks it dramatically) ---
 pl.scan_csv(
     "Z:/PATSTAT Global 2025 Autumn/tls207_pers_appln_part01.csv",
-    schema_overrides={"appln_id": pl.Int32, "person_id": pl.Int32},
+    schema_overrides={
+        "appln_id": pl.Int32,
+        "person_id": pl.Int32,
+        "applt_seq_nr": pl.Int32,
+        "invt_seq_nr": pl.Int32,
+    },
     null_values=patstat_null_values,
 ).join(
     tls201_index.select("appln_id"),
@@ -138,6 +143,11 @@ clean_exprs = [
     for c in cols_agg
 ]
 
+role_clean_exprs = [
+    pl.col("applt_seq_nr").cast(pl.Int32, strict=False).fill_null(0).alias("applt_seq_nr"),
+    pl.col("invt_seq_nr").cast(pl.Int32, strict=False).fill_null(0).alias("invt_seq_nr"),
+]
+
 agg_exprs = [
     pl.col(c)
       .drop_nulls()
@@ -148,12 +158,153 @@ agg_exprs = [
     for c in cols_agg
 ]
 
-(
+persons_clean = (
     pl.scan_parquet("PATSTAT2025FALL/output/tls207_joined_persons.parquet")
-    .with_columns(clean_exprs)
+    .with_columns(clean_exprs + role_clean_exprs)
+)
+
+
+def role_persons(role_seq_col: str) -> pl.LazyFrame:
+    return persons_clean.filter(pl.col(role_seq_col) > 0)
+
+
+def role_agg(role_seq_col: str, prefix: str, plural: str) -> pl.LazyFrame:
+    return (
+        role_persons(role_seq_col)
+        .group_by("appln_id")
+        .agg([
+            pl.col("person_name")
+            .drop_nulls()
+            .unique()
+            .sort()
+            .str.join(",")
+            .alias(plural),
+            pl.col("person_ctry_code")
+            .drop_nulls()
+            .unique()
+            .sort()
+            .str.join(",")
+            .alias(f"{prefix}_country_list"),
+            pl.col("person_id")
+            .drop_nulls()
+            .unique()
+            .sort()
+            .str.join(",")
+            .alias(f"{prefix}_ids"),
+            pl.len().alias(f"n_{plural}_rows"),
+        ])
+    )
+
+
+def save_country_contribution(role_seq_col: str, prefix: str):
+    count_col = f"n_{prefix}s_country"
+    total_col = f"n_{prefix}s_total"
+    frac_col = f"{prefix}_frac"
+
+    appln_people = (
+        role_persons(role_seq_col)
+        .filter(pl.col("person_ctry_code").is_not_null())
+        .select(["appln_id", "person_id", "person_ctry_code"])
+        .unique(subset=["appln_id", "person_id"])
+        .join(tls201_index, on="appln_id", how="left")
+    )
+    (
+        appln_people
+        .group_by(["appln_id", "docdb_family_id", "person_ctry_code"])
+        .agg(pl.len().alias(count_col))
+        .with_columns(pl.col(count_col).sum().over("appln_id").alias(total_col))
+        .with_columns((pl.col(count_col) / pl.col(total_col)).alias(frac_col))
+        .rename({"person_ctry_code": "country"})
+        .sink_parquet(
+            f"PATSTAT2025FALL/output/{prefix}_country_contrib_appln.parquet",
+            compression="zstd",
+            engine="streaming",
+        )
+    )
+
+    family_people = (
+        role_persons(role_seq_col)
+        .filter(pl.col("person_ctry_code").is_not_null())
+        .join(tls201_index, on="appln_id", how="left")
+        .select(["docdb_family_id", "person_id", "person_ctry_code"])
+        .unique(subset=["docdb_family_id", "person_id"])
+    )
+    (
+        family_people
+        .group_by(["docdb_family_id", "person_ctry_code"])
+        .agg(pl.len().alias(count_col))
+        .with_columns(pl.col(count_col).sum().over("docdb_family_id").alias(total_col))
+        .with_columns((pl.col(count_col) / pl.col(total_col)).alias(frac_col))
+        .rename({"person_ctry_code": "country"})
+        .sink_parquet(
+            f"PATSTAT2025FALL/output/{prefix}_country_contrib_family.parquet",
+            compression="zstd",
+            engine="streaming",
+        )
+    )
+
+
+save_country_contribution("invt_seq_nr", "inventor")
+save_country_contribution("applt_seq_nr", "applicant")
+
+
+def country_count_agg(prefix: str) -> pl.LazyFrame:
+    count_col = f"n_{prefix}s_country"
+    return (
+        pl.scan_parquet(f"PATSTAT2025FALL/output/{prefix}_country_contrib_appln.parquet")
+        .with_columns(
+            pl.concat_str([
+                pl.col("country"),
+                pl.lit(":"),
+                pl.col(count_col).cast(pl.Utf8),
+            ]).alias("_country_count")
+        )
+        .group_by("appln_id")
+        .agg(
+            pl.col("_country_count")
+            .sort()
+            .str.join(",")
+            .alias(f"{prefix}_country_counts")
+        )
+    )
+
+
+persons_agg = (
+    persons_clean
     .group_by("appln_id")
     .agg(agg_exprs)
-    .sink_parquet("PATSTAT2025FALL/output/persons_agg.parquet", compression="zstd", engine="streaming")
+    .join(role_agg("invt_seq_nr", "inventor", "inventors"), on="appln_id", how="left")
+    .join(role_agg("applt_seq_nr", "applicant", "applicants"), on="appln_id", how="left")
+    .join(country_count_agg("inventor"), on="appln_id", how="left")
+    .join(country_count_agg("applicant"), on="appln_id", how="left")
+    .with_columns([
+        pl.when(
+            pl.col("inventors").is_not_null()
+            & (
+                pl.col("inventor_country_list").is_null()
+                | (pl.col("inventor_country_list") == "")
+            )
+        )
+        .then(pl.col("person_ctry_code"))
+        .otherwise(pl.col("inventor_country_list"))
+        .alias("inventor_country_list"),
+        pl.when(
+            pl.col("applicants").is_not_null()
+            & (
+                pl.col("applicant_country_list").is_null()
+                | (pl.col("applicant_country_list") == "")
+            )
+        )
+        .then(pl.col("person_ctry_code"))
+        .otherwise(pl.col("applicant_country_list"))
+        .alias("applicant_country_list"),
+    ])
+)
+
+persons_agg.sink_parquet(
+    "PATSTAT2025FALL/output/persons_agg.parquet",
+    compression="zstd",
+    engine="streaming",
 )
 gc.collect()
 
@@ -188,6 +339,20 @@ joined_tls211 = joined_df.join(
 joined_tls211.sink_parquet("PATSTAT2025FALL/output/joined_tls211.parquet", compression="zstd")
 del joined_df, tls211_scan
 gc.collect()
+
+claims_check = (
+    pl.scan_parquet("PATSTAT2025FALL/output/joined_tls211.parquet")
+    .select([
+        pl.len().alias("rows"),
+        pl.col("publn_claims").is_null().sum().alias("null_claims"),
+        (pl.col("publn_claims") == 0).sum().alias("zero_claims"),
+        (pl.col("publn_claims") > 0).sum().alias("positive_claims"),
+        pl.col("publn_claims").quantile(0.99).alias("p99_claims"),
+        pl.col("publn_claims").max().alias("max_claims"),
+    ])
+    .collect()
+)
+print("Publication claims diagnostic:", claims_check.to_dicts()[0])
 
 # CPC at DOCDB FAM LEVEL -- use semi-join instead of Python set
 tls201_index = pl.scan_parquet("PATSTAT2025FALL/output/tls201_index.parquet")
@@ -582,7 +747,11 @@ patent_df = patent_df.select([
     'docdb_family_id', 'docdb_family_size', 'nb_applicants',
     'nb_inventors', 'nb_citing_docdb_fam', 'appln_title_lg',
     'appln_title', 'person_name', 'person_ctry_code', 'person_id',
-    'psn_id', 'psn_sector', 'han_id', 'han_name', 'publn_claims',
+    'psn_id', 'psn_sector', 'han_id', 'han_name',
+    'inventors', 'inventor_country_list', 'inventor_country_counts',
+    'inventor_ids', 'n_inventors_rows',
+    'applicants', 'applicant_country_list', 'applicant_country_counts',
+    'applicant_ids', 'n_applicants_rows', 'publn_claims',
     'publn_nr', 'cpc_class_symbol', 'cpc', 'ipc', 'green', 'sector',
     'mitigation_adaptation',
 ])
@@ -608,3 +777,90 @@ def save2csv(df, name="green_patent.csv", list_columns_to_stringify=None, delimi
     df.write_csv(name)
 save2csv(patent_df, name="PATSTAT2025FALL/output/green_patent8526.csv")
 patent_df.write_parquet("PATSTAT2025FALL/output/green_patent8526.parquet", compression="zstd")
+
+
+def family_country_counts(prefix: str) -> pl.DataFrame:
+    count_col = f"n_{prefix}s_country"
+    total_col = f"n_{prefix}s_total"
+    frac_col = f"{prefix}_frac"
+    path = f"PATSTAT2025FALL/output/{prefix}_country_contrib_family.parquet"
+
+    return (
+        pl.read_parquet(path)
+        .with_columns([
+            pl.concat_str([
+                pl.col("country"),
+                pl.lit(":"),
+                pl.col(count_col).cast(pl.Utf8),
+            ]).alias("_country_count"),
+            pl.concat_str([
+                pl.col("country"),
+                pl.lit(":"),
+                pl.col(frac_col).round(6).cast(pl.Utf8),
+            ]).alias("_country_share"),
+        ])
+        .group_by("docdb_family_id")
+        .agg([
+            pl.col("country").unique().sort().alias(f"{prefix}_country_list_family"),
+            pl.col("_country_count").sort().str.join(",").alias(f"{prefix}_country_counts_family"),
+            pl.col("_country_share").sort().str.join(",").alias(f"{prefix}_country_shares_family"),
+            pl.col(total_col).max().alias(total_col),
+            pl.col("country").n_unique().alias(f"n_{prefix}_countries"),
+        ])
+    )
+
+
+green_family_df = (
+    patent_df
+    .lazy()
+    .group_by("docdb_family_id")
+    .agg([
+        pl.col("appln_id").n_unique().alias("n_green_applications"),
+        pl.col("appln_id").cast(pl.Utf8).unique().sort().str.join(",").alias("appln_ids"),
+        pl.col("appln_auth").drop_nulls().unique().sort().str.join(",").alias("appln_auths"),
+        pl.col("earliest_filing_date").min(),
+        pl.col("year").min() if "year" in patent_df.columns else pl.col("earliest_filing_date").str.slice(0, 4).cast(pl.Int16).min().alias("year"),
+        pl.col("docdb_family_size").max(),
+        pl.col("nb_applicants").max(),
+        pl.col("nb_inventors").max(),
+        pl.col("nb_citing_docdb_fam").max(),
+        pl.col("appln_title").drop_nulls().first(),
+        pl.col("appln_title_lg").drop_nulls().first(),
+        pl.col("publn_claims").max(),
+        pl.col("cpc").drop_nulls().first(),
+        pl.col("cpc_class_symbol").drop_nulls().first(),
+        pl.col("ipc").drop_nulls().first(),
+        pl.col("sector").drop_nulls().first(),
+        pl.col("mitigation_adaptation").drop_nulls().first(),
+        pl.col("person_ctry_code").drop_nulls().unique().sort().str.join(",").alias("person_ctry_code_family"),
+        pl.col("inventor_country_list").drop_nulls().unique().sort().str.join(",").alias("inventor_country_list_from_apps"),
+        pl.col("applicant_country_list").drop_nulls().unique().sort().str.join(",").alias("applicant_country_list_from_apps"),
+        pl.col("han_name").drop_nulls().unique().sort().str.join(",").alias("han_name_family"),
+    ])
+    .collect()
+    .join(family_country_counts("inventor"), on="docdb_family_id", how="left")
+    .join(family_country_counts("applicant"), on="docdb_family_id", how="left")
+)
+
+green_family_df.write_parquet(
+    "PATSTAT2025FALL/output/green_patent_family8526.parquet",
+    compression="zstd",
+)
+
+green_family_csv = green_family_df.with_columns([
+    pl.col("cpc").list.join(";").alias("cpc"),
+    pl.col("cpc_class_symbol").list.join(";").alias("cpc_class_symbol"),
+    pl.col("ipc").list.join(";").alias("ipc"),
+    pl.col("inventor_country_list_family").list.join(",").alias("inventor_country_list_family"),
+    pl.col("applicant_country_list_family").list.join(",").alias("applicant_country_list_family"),
+])
+green_family_csv.write_csv("PATSTAT2025FALL/output/green_patent_family8526.csv")
+
+print(
+    "Saved family-level green patent table:",
+    {
+        "rows": green_family_df.height,
+        "columns": len(green_family_df.columns),
+        "path": "PATSTAT2025FALL/output/green_patent_family8526.parquet",
+    },
+)
